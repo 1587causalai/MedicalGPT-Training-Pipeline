@@ -379,10 +379,10 @@ def main():
             load_from_cache_file=not args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
-        eval_dataset = eval_dataset.filter(
-            lambda x: 0 < len(x['prompt'] + x['chosen']) <= full_max_length
-                      and 0 < len(x['prompt'] + x['rejected']) <= full_max_length
-        )
+        # eval_dataset = eval_dataset.filter(
+        #     lambda x: 0 < len(x['prompt'] + x['chosen']) <= full_max_length
+        #               and 0 < len(x['prompt'] + x['rejected']) <= full_max_length
+        # )
         logger.debug(f"Num eval_samples: {len(eval_dataset)}")
         logger.debug("First eval example:")
         first_example = eval_dataset[0]
@@ -520,3 +520,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
