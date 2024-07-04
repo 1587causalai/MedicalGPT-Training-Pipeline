@@ -1,5 +1,7 @@
 # MedicalGPT: Training Medical GPT Model
 
+我看了整个训练流程，作者是从去年6月份就开始了，都快一年了，是一个精挑细选，精心优化的训练流程。我从中可以学习的东西应该非常非常多。
+
 
 ## Zero2All 学习过程
 
