@@ -186,7 +186,6 @@ def compute_metrics(eval_preds):
     mae = mean_absolute_error(labels, preds)
 
     return {"mse": mse, "mae": mae}
-我想强制远程的覆盖本地。
 
 @dataclass
 class RewardDataCollatorWithPadding:
