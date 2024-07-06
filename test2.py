@@ -9,8 +9,9 @@ import os
 from dataclasses import dataclass, field
 from glob import glob
 from typing import Any, List, Union, Optional, Dict
-
 import torch
+from torch.distributions import Normal
+
 from datasets import load_dataset
 from loguru import logger
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel, prepare_model_for_kbit_training
@@ -37,12 +38,114 @@ from transformers import (
 from transformers.trainer import TRAINING_ARGS_NAME
 
 from template import get_conv_template
+import torch
+import torch.nn as nn
+from torch.nn import MSELoss
+from typing import Optional, Tuple, Union
+from dataclasses import dataclass
+from torch.distributions import Normal
+
+from transformers import BloomModel, BloomPreTrainedModel, BloomConfig
+from transformers.modeling_outputs import ModelOutput
+
+
+@dataclass
+class GaussianRewardModelOutput(ModelOutput):
+    """
+    Output class for the Gaussian Reward Model.
+    """
+    loss: Optional[torch.FloatTensor] = None
+    mean: torch.FloatTensor = None
+    variance: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    attentions: Optional[Tuple[torch.FloatTensor]] = None
+
+
+class BloomForGaussianRewardModeling(BloomPreTrainedModel):
+    def __init__(self, config: BloomConfig):
+        super().__init__(config)
+        self.transformer = BloomModel(config)
+        self.score = nn.Linear(config.hidden_size, 2, bias=False)
+        self.post_init()
+
+    def forward(
+            self,
+            input_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor], ...]] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            head_mask: Optional[torch.Tensor] = None,
+            inputs_embeds: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+    ) -> Union[Tuple[torch.Tensor], GaussianRewardModelOutput]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        transformer_outputs = self.transformer(
+            input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = transformer_outputs[0]
+        logits = self.score(hidden_states)
+
+        mean, log_var = logits.split(1, dim=-1)
+        var = torch.exp(log_var)
+
+        # 使用最后一个非填充token的输出
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+        else:
+            batch_size = inputs_embeds.shape[0]
+
+        if self.config.pad_token_id is None and batch_size != 1:
+            raise ValueError("Cannot handle batch sizes > 1 if no padding token is defined.")
+        if self.config.pad_token_id is None:
+            sequence_lengths = -1
+        else:
+            if input_ids is not None:
+                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
+                sequence_lengths = sequence_lengths % input_ids.shape[-1]
+            else:
+                sequence_lengths = -1
+
+        pooled_mean = mean[torch.arange(batch_size, device=mean.device), sequence_lengths].squeeze(-1)
+        pooled_var = var[torch.arange(batch_size, device=var.device), sequence_lengths].squeeze(-1)
+
+        loss = None
+        if labels is not None:
+            loss = -torch.distributions.Normal(pooled_mean, torch.sqrt(pooled_var)).log_prob(labels).mean()
+
+        if not return_dict:
+            output = (pooled_mean, pooled_var) + transformer_outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return GaussianRewardModelOutput(
+            loss=loss,
+            mean=pooled_mean,
+            variance=pooled_var,
+            past_key_values=transformer_outputs.past_key_values,
+            hidden_states=transformer_outputs.hidden_states,
+            attentions=transformer_outputs.attentions,
+        )
+
+
 
 MODEL_CLASSES = {
     "bert": (AutoConfig, BertForSequenceClassification, BertTokenizer),
     "roberta": (AutoConfig, RobertaForSequenceClassification, RobertaTokenizer),
     "albert": (AutoConfig, AlbertForSequenceClassification, AutoTokenizer),
-    "bloom": (AutoConfig, BloomForSequenceClassification, BloomTokenizerFast),
+    "bloom": (AutoConfig, BloomForGaussianRewardModeling, BloomTokenizerFast),
     "llama": (AutoConfig, LlamaForSequenceClassification, AutoTokenizer),
     "auto": (AutoConfig, AutoModelForSequenceClassification, AutoTokenizer),
 }
@@ -186,7 +289,7 @@ def compute_metrics(eval_preds):
     mae = mean_absolute_error(labels, preds)
 
     return {"mse": mse, "mae": mae}
-我想强制远程的覆盖本地。
+
 
 @dataclass
 class RewardDataCollatorWithPadding:
@@ -239,18 +342,37 @@ class RewardDataCollatorWithPadding:
 
 class RewardTrainer(Trainer):
     """
-    Trainer for reward models
-        Define how to compute the reward loss. Use the InstructGPT pairwise logloss: https://arxiv.org/abs/2203.02155
+    Trainer for Disco Reward models
+    Implements the Disco Rewards Models approach for estimating rewards and preferences.
     """
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        rewards_chosen = model(input_ids=inputs["input_ids_chosen"],
-                               attention_mask=inputs["attention_mask_chosen"])[0]
-        rewards_rejected = model(input_ids=inputs["input_ids_rejected"],
-                                 attention_mask=inputs["attention_mask_rejected"])[0]
-        loss = -torch.nn.functional.logsigmoid(rewards_chosen - rewards_rejected).mean()
+        # Step 1: Estimating Disco Reward
+        outputs_chosen = model(input_ids=inputs["input_ids_chosen"],
+                               attention_mask=inputs["attention_mask_chosen"])
+        outputs_rejected = model(input_ids=inputs["input_ids_rejected"],
+                                 attention_mask=inputs["attention_mask_rejected"])
+
+        mean_chosen, var_chosen = outputs_chosen.mean, outputs_chosen.variance
+        mean_rejected, var_rejected = outputs_rejected.mean, outputs_rejected.variance
+
+        # Step 2: Estimating Personalized Contextual Preference
+        standardized_diff = (mean_chosen - mean_rejected) / torch.sqrt(var_chosen + var_rejected)
+        normal = Normal(torch.tensor([0.0]), torch.tensor([1.0]))
+        preference_prob = normal.cdf(standardized_diff)
+
+        # Computing loss
+        eps = 1e-8  # Small constant to avoid log(0)
+        loss = -torch.log(preference_prob + eps).mean()
+
         if return_outputs:
-            return loss, {"rewards_chosen": rewards_chosen, "rewards_rejected": rewards_rejected}
+            return loss, {
+                "mean_chosen": mean_chosen,
+                "var_chosen": var_chosen,
+                "mean_rejected": mean_rejected,
+                "var_rejected": var_rejected,
+                "preference_prob": preference_prob
+            }
         return loss
 
     def evaluate(
@@ -272,21 +394,27 @@ class RewardTrainer(Trainer):
             "attention_mask": inputs["attention_mask_chosen"].to(device),
         }
         outputs_chosen = model(**inputs_chosen)
-        rewards_chosen = outputs_chosen.logits.detach()
+        mean_chosen, var_chosen = outputs_chosen.mean, outputs_chosen.variance
 
         inputs_rejected = {
             "input_ids": inputs["input_ids_rejected"].to(device),
             "attention_mask": inputs["attention_mask_rejected"].to(device),
         }
         outputs_rejected = model(**inputs_rejected)
-        rewards_rejected = outputs_rejected.logits.detach()
+        mean_rejected, var_rejected = outputs_rejected.mean, outputs_rejected.variance
 
-        # Keep the compute_loss method
-        loss = -torch.nn.functional.logsigmoid(rewards_chosen - rewards_rejected).mean()
+        # Calculate preference probability
+        standardized_diff = (mean_chosen - mean_rejected) / torch.sqrt(var_chosen + var_rejected)
+        normal = torch.distributions.Normal(torch.tensor([0.0]), torch.tensor([1.0]))
+        preference_prob = normal.cdf(standardized_diff)
+
+        # Compute loss
+        loss = -torch.log(preference_prob + 1e-8).mean()
+
         if prediction_loss_only:
-            return (loss, None, None)
+            return (loss, None, None, None, None)
 
-        return (loss, rewards_chosen, rewards_rejected)
+        return (loss, mean_chosen, var_chosen, mean_rejected, var_rejected)
 
     def save_model(self, output_dir=None, _internal_call=False):
         """Save the LoRA model."""
