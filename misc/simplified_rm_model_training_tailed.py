@@ -1,7 +1,9 @@
 import torch
+import torch.nn as nn
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, Trainer, TrainingArguments
 from peft import LoraConfig, get_peft_model
 from datasets import load_dataset
+from transformers import AutoModel, AutoConfig
 
 print("脚本开始执行...")
 
@@ -16,14 +18,40 @@ def find_all_linear_names(model):
     return sorted(set(linear_layers))
 
 
+class DiscoRewardModel(nn.Module):
+    def __init__(self, pretrained_model_name_or_path, num_labels=1):
+        super().__init__()
+        self.config = AutoConfig.from_pretrained(pretrained_model_name_or_path)
+        self.base_model = AutoModel.from_pretrained(pretrained_model_name_or_path, config=self.config)
+        self.mean_head = nn.Linear(self.config.hidden_size, num_labels)
+        self.log_var_head = nn.Linear(self.config.hidden_size, num_labels)
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        pooled_output = outputs.last_hidden_state[:, 0]
+        mean = self.mean_head(pooled_output)
+        log_var = self.log_var_head(pooled_output)
+        return (mean, log_var)
+
+    def estimate_preference(self, input_ids_1, attention_mask_1, input_ids_2, attention_mask_2):
+        mean_1, log_var_1 = self.forward(input_ids_1, attention_mask_1)
+        mean_2, log_var_2 = self.forward(input_ids_2, attention_mask_2)
+
+        var_1 = torch.exp(log_var_1)
+        var_2 = torch.exp(log_var_2)
+
+        # 计算偏好概率
+        pref_prob = torch.special.ndtr((mean_1 - mean_2) / torch.sqrt(var_1 + var_2))
+
+        return pref_prob
+
 print("\n正在加载模型和tokenizer...")
 model_name = "merged-sft"
 config = AutoConfig.from_pretrained(model_name, num_labels=1)
-model = AutoModelForSequenceClassification.from_pretrained(model_name, config=config)
+model = DiscoRewardModel(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-
 print(f"模型名称: {model_name}")
-# print(f"模型结构: {model}")
+
 
 target_modules = find_all_linear_names(model)
 print(f"\n找到的可训练线性层: {target_modules}")
@@ -37,7 +65,6 @@ peft_config = LoraConfig(
     target_modules=target_modules
 )
 print(f"PEFT配置: {peft_config}")
-
 model = get_peft_model(model, peft_config)
 print("\nPEFT模型创建成功")
 
@@ -119,21 +146,37 @@ class RewardDataCollatorWithPadding:
 
 class RewardTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
-        rewards_chosen = model(input_ids=inputs["input_ids_chosen"], attention_mask=inputs["attention_mask_chosen"])[0]
-        rewards_rejected = \
-            model(input_ids=inputs["input_ids_rejected"], attention_mask=inputs["attention_mask_rejected"])[0]
-        loss = -torch.nn.functional.logsigmoid(rewards_chosen - rewards_rejected).mean()
+        mean_chosen, log_var_chosen = model(input_ids=inputs["input_ids_chosen"],
+                                            attention_mask=inputs["attention_mask_chosen"])
+        mean_rejected, log_var_rejected = model(input_ids=inputs["input_ids_rejected"],
+                                                attention_mask=inputs["attention_mask_rejected"])
+
+        var_chosen = torch.exp(log_var_chosen)
+        var_rejected = torch.exp(log_var_rejected)
+
+        # 计算偏好概率，但不作为输出
+        pref_prob = torch.special.ndtr((mean_chosen - mean_rejected) / torch.sqrt(var_chosen + var_rejected))
+        loss = -torch.log(pref_prob).mean()
+
         if return_outputs:
-            return loss, {"rewards_chosen": rewards_chosen, "rewards_rejected": rewards_rejected}
+            return loss, {
+                "rewards_chosen": mean_chosen,  # 使用均值作为 "reward"
+                "rewards_rejected": mean_rejected
+            }
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        with torch.no_grad():  # 确保不计算梯度
-            rewards_chosen = \
-                model(input_ids=inputs["input_ids_chosen"], attention_mask=inputs["attention_mask_chosen"])[0]
-            rewards_rejected = \
-                model(input_ids=inputs["input_ids_rejected"], attention_mask=inputs["attention_mask_rejected"])[0]
-            loss = -torch.nn.functional.logsigmoid(rewards_chosen - rewards_rejected).mean()
+        with torch.no_grad():
+            mean_chosen, log_var_chosen = model(input_ids=inputs["input_ids_chosen"],
+                                                attention_mask=inputs["attention_mask_chosen"])
+            mean_rejected, log_var_rejected = model(input_ids=inputs["input_ids_rejected"],
+                                                    attention_mask=inputs["attention_mask_rejected"])
+
+            var_chosen = torch.exp(log_var_chosen)
+            var_rejected = torch.exp(log_var_rejected)
+
+            pref_prob = torch.special.ndtr((mean_chosen - mean_rejected) / torch.sqrt(var_chosen + var_rejected))
+            loss = -torch.log(pref_prob).mean()
 
         # 确保所有返回的张量都被分离
         return (loss.detach(), None, None)
