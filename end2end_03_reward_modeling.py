@@ -633,7 +633,6 @@ def main():
             tokenizer=tokenizer, max_length=full_max_length, padding="max_length"
         ),
     )
-
     # Training
     if training_args.do_train:
         logger.info("*** Train ***")
@@ -641,6 +640,74 @@ def main():
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
+        
+        logger.info("*** Single Training Step ***")
+        
+        # 获取一个批次的数据
+        train_dataloader = trainer.get_train_dataloader()
+        batch = next(iter(train_dataloader))
+        
+        if trainer.is_world_process_zero():
+            logger.debug(f"Number of train dataloader example: {batch['input_ids_chosen'].shape}")
+            logger.debug(f"input_ids_chosen:\n{list(batch['input_ids_chosen'])[0]}")
+            logger.debug(f"input_ids_rejected:\n{list(batch['input_ids_rejected'])[0]}")
+            logger.debug(f"Decode input_ids_chosen[0]:\n{tokenizer.decode(batch['input_ids_chosen'][0])}")
+            logger.debug(f"Decode input_ids_rejected[0]:\n{tokenizer.decode(batch['input_ids_rejected'][0])}")
+
+        # 将数据移到正确的设备上，只处理tensor类型的数据
+        batch = {k: v.to(trainer.model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        # 设置模型为训练模式
+        trainer.model.train()
+        
+        # 前向传播
+        logger.info("--- Forward Pass ---")
+        with torch.cuda.amp.autocast(enabled=training_args.fp16):
+            outputs = trainer.model(**batch)
+        
+        logger.info("Model outputs:")
+        for k, v in outputs.items():
+            if isinstance(v, torch.Tensor):
+                logger.info(f"{k} shape: {v.shape}")
+                logger.info(f"{k} first few values: {v.flatten()[:5]}")
+
+        # 计算损失
+        logger.info("--- Loss Computation ---")
+        loss = trainer.compute_loss(trainer.model, batch)
+        logger.info(f"Computed loss: {loss.item()}")
+
+        # 反向传播
+        logger.info("--- Backward Pass ---")
+        if training_args.gradient_accumulation_steps > 1:
+            loss = loss / training_args.gradient_accumulation_steps
+        loss.backward()
+        
+        # 记录梯度信息
+        logger.info("Gradients:")
+        for name, param in trainer.model.named_parameters():
+            if param.grad is not None:
+                logger.info(f"{name} grad norm: {param.grad.norm().item()}")
+
+        # 更新参数
+        trainer.optimizer.step()
+        trainer.lr_scheduler.step()
+        trainer.optimizer.zero_grad()
+
+        logger.info("=== Single Training Step Completed ===")
+
+        # 构造一个模拟的 TrainOutput 对象
+        train_result = TrainOutput(global_step=1, training_loss=loss.item(), metrics={})
+
+        metrics = {"train_loss": loss.item()}
+        metrics["train_samples"] = 1
+        trainer.log_metrics("train", metrics)
+        trainer.save_metrics("train", metrics)
+        trainer.save_state()
+
+    if trainer.is_world_process_zero():
+        save_model(trainer.model, tokenizer, training_args)
+       
+        
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
         metrics = train_result.metrics
