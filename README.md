@@ -27,7 +27,8 @@ Supervised Finetuning, RLHF(Reward Modeling and Reinforcement Learning) and DPO(
 
 ## 🔥 News
 
-[2023/07/03] 本项目专注 LLM 训练流程对 [MedicalGPT](https://github.com/shibing624/MedicalGPT)项目进行简化。
+- [2024/07/18] Disco Reward Modeling 简单的实现。
+- [2024/07/03] 本项目专注 LLM 训练流程对 [MedicalGPT](https://github.com/shibing624/MedicalGPT)项目进行简化。
 
 
 ## 😊 Features
