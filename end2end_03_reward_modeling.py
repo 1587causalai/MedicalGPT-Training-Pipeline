@@ -64,7 +64,7 @@ class ModelArguments:
         default=None,
         metadata={
             "help": "Model type selected in the list: "
-            + ", ".join(MODEL_CLASSES.keys())
+                    + ", ".join(MODEL_CLASSES.keys())
         },
     )
     model_name_or_path: Optional[str] = field(
@@ -295,10 +295,10 @@ class RewardTrainer(Trainer):
         return loss
 
     def evaluate(
-        self,
-        eval_dataset: Optional[Dataset] = None,
-        ignore_keys: Optional[List[str]] = None,
-        metric_key_prefix: str = "eval",
+            self,
+            eval_dataset: Optional[Dataset] = None,
+            ignore_keys: Optional[List[str]] = None,
+            metric_key_prefix: str = "eval",
     ) -> Dict[str, float]:
         if eval_dataset is None:
             eval_dataset = self.eval_dataset
@@ -559,7 +559,7 @@ def main():
     else:
         data_files = {}
         if data_args.train_file_dir is not None and os.path.exists(
-            data_args.train_file_dir
+                data_args.train_file_dir
         ):
             train_data_files = glob(
                 f"{data_args.train_file_dir}/**/*.json", recursive=True
@@ -567,7 +567,7 @@ def main():
             logger.info(f"train files: {', '.join(train_data_files)}")
             data_files["train"] = train_data_files
         if data_args.validation_file_dir is not None and os.path.exists(
-            data_args.validation_file_dir
+                data_args.validation_file_dir
         ):
             eval_data_files = glob(
                 f"{data_args.validation_file_dir}/**/*.json", recursive=True
@@ -610,11 +610,11 @@ def main():
             "attention_mask_rejected": [],
         }
         for system, history, question, chosen, rejected in zip(
-            examples["system"],
-            examples["history"],
-            examples["question"],
-            examples["response_chosen"],
-            examples["response_rejected"],
+                examples["system"],
+                examples["history"],
+                examples["question"],
+                examples["response_chosen"],
+                examples["response_rejected"],
         ):
             system_prompt = system or ""
             chosen_messages = (
@@ -665,7 +665,7 @@ def main():
             )
             train_dataset = tokenized_dataset.filter(
                 lambda x: 0 < len(x["input_ids_rejected"]) <= full_max_length
-                and 0 < len(x["input_ids_chosen"]) <= full_max_length
+                          and 0 < len(x["input_ids_chosen"]) <= full_max_length
             )
             logger.debug(f"Num train_samples: {len(train_dataset)}")
             logger.debug("Tokenized training example:")
@@ -680,8 +680,8 @@ def main():
             eval_dataset = raw_datasets["validation"]
             max_eval_samples = len(eval_dataset)
             if (
-                data_args.max_eval_samples is not None
-                and data_args.max_eval_samples > 0
+                    data_args.max_eval_samples is not None
+                    and data_args.max_eval_samples > 0
             ):
                 max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
                 eval_dataset = eval_dataset.select(range(max_eval_samples))
@@ -696,7 +696,7 @@ def main():
             )
             eval_dataset = tokenized_dataset.filter(
                 lambda x: 0 < len(x["input_ids_rejected"]) <= full_max_length
-                and 0 < len(x["input_ids_chosen"]) <= full_max_length
+                          and 0 < len(x["input_ids_chosen"]) <= full_max_length
             )
             logger.debug(f"Num eval_samples: {len(eval_dataset)}")
             logger.debug("Tokenized eval example:")
